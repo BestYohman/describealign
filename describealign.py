@@ -756,65 +756,103 @@ def get_closest_key_frame_time(video_file, time):
 
 # outputs a new media file with the replaced audio (which includes audio descriptions)
 def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, audio_desc_file=None,
-                                 setts_cmd=None, start_key_frame=None):
-  if audio_desc_file is None:
-    media_input = ffmpeg.input('pipe:', format='s16le', acodec='pcm_s16le',
-                               ac=2, ar=AUDIO_SAMPLE_RATE)
-    if video_file is None or os.path.splitext(output_filename)[1][1:] in AUDIO_EXTENSIONS:
-      write_command = ffmpeg.output(media_input, output_filename, loglevel='fatal').overwrite_output()
-    else:
-      original_video = ffmpeg.input(video_file)
-      # "-max_interleave_delta 0" is sometimes necessary to fix an .mkv bug that freezes audio/video:
-      #   ffmpeg bug warning: [matroska @ 0000000002c814c0] Starting new cluster due to timestamp
-      # more info about the bug and fix: https://reddit.com/r/ffmpeg/comments/efddfs/
-      write_command = ffmpeg.output(media_input, original_video, output_filename,
-                                    acodec='copy', vcodec='copy', scodec='copy',
-                                    max_interleave_delta='0', loglevel='fatal',
-                                    **{"c:a:0": "aac", "disposition:a:0": "default"}).overwrite_output()
-    ffmpeg_caller = write_command.run_async(pipe_stdin=True, cmd=get_ffmpeg())
-    ffmpeg_caller.stdin.write(media_arr.astype(np.int16).T.tobytes())
-    ffmpeg_caller.stdin.close()
-    ffmpeg_caller.wait()
-  else:
-    media_input = ffmpeg.input(audio_desc_file)
-    audio_desc_streams = ffmpeg.probe(audio_desc_file, cmd=get_ffprobe(), select_streams='a',
-                                      show_entries='format=duration')['streams']
-    audio_desc_duration = max([float(stream['duration']) for stream in audio_desc_streams])
-    original_video = ffmpeg.input(video_file, an=None, ss=start_key_frame)
-    if os.path.splitext(output_filename)[1] == os.path.splitext(video_file)[1]:
-      # wav files don't have codecs compatible with most video containers, so we convert to aac
-      audio_codec = 'copy' if os.path.splitext(audio_desc_file)[1] != '.wav' else 'aac'
-      # flac audio may only have experimental support in some video containers (e.g. mp4)
-      standards = 'normal' if os.path.splitext(audio_desc_file)[1] != '.flac' else 'experimental'
-      write_command = ffmpeg.output(media_input, original_video, output_filename,
-                                    acodec=audio_codec, vcodec='copy', scodec='copy',
-                                    max_interleave_delta='0', loglevel='fatal', strict=standards,
-                                    **{'bsf:v': f'setts=ts=\'{setts_cmd}\'',
-                                       'bsf:s': f'setts=ts=\'{setts_cmd}\''}).overwrite_output()
-      write_command.run(cmd=get_ffmpeg())
-    else:
-      # work around for bug that sometimes breaks setts when output and input formats differ
-      # the trick is separating the input and output by piping from one ffmpeg process into another
-      # mkv files break if 'nut' is used, while other files break when 'matroska' is used
-      format = 'matroska' if os.path.splitext(output_filename)[1] == '.mkv' else 'nut'
-      write_command = ffmpeg.output(original_video, 'pipe:', format=format, vsync='passthrough',
-                                    c='copy', loglevel='fatal')
-      ffmpeg_caller = write_command.run_async(pipe_stdout=True, cmd=get_ffmpeg())
-      pipe_input = ffmpeg.input('pipe:', format=format, thread_queue_size='512')
-      write_command2 = ffmpeg.output(media_input, pipe_input, output_filename, c='copy',
-                                     max_interleave_delta='0', loglevel='fatal', vsync='passthrough',
-                                     **{'bsf:v': f'setts=ts=\'{setts_cmd}\'',
-                                        'bsf:s': f'setts=ts=\'{setts_cmd}\''}).overwrite_output()
-      ffmpeg_caller2 = write_command2.run_async(pipe_stdin=True, cmd=get_ffmpeg())
-      while True:
-        in_bytes = ffmpeg_caller.stdout.read(100000)
-        if not in_bytes:
-          break
-        ffmpeg_caller2.stdin.write(in_bytes)
-      ffmpeg_caller2.stdin.close()
-      ffmpeg_caller.wait()
-      ffmpeg_caller2.wait()
+                                 setts_cmd=None, start_key_frame=None, audio_track_name="Audio Description"):
+    """
+    Outputs a new media file with the replaced audio (which includes audio descriptions).
 
+    Args:
+        output_filename: The name of the output file.
+        media_arr: The audio data as a NumPy array (if audio is processed).
+        video_file: The original video file (if applicable).
+        audio_desc_file: The audio description file (if applicable).
+        setts_cmd: The ffmpeg expression for adjusting timestamps.
+        start_key_frame: The starting keyframe for timestamp adjustments.
+        audio_track_name: The name to give to the audio description track.
+    """
+
+    if audio_desc_file is None:
+        # Audio is processed and passed as media_arr
+        media_input = ffmpeg.input('pipe:', format='s16le', acodec='pcm_s16le',
+                                   ac=2, ar=AUDIO_SAMPLE_RATE)
+        if video_file is None or os.path.splitext(output_filename)[1][1:] in AUDIO_EXTENSIONS:
+            write_command = ffmpeg.output(media_input, output_filename, loglevel='fatal').overwrite_output()
+        else:
+            original_video = ffmpeg.input(video_file)
+            # "-max_interleave_delta 0" is sometimes necessary to fix an .mkv bug that freezes audio/video:
+            #   ffmpeg bug warning: [matroska @ 0000000002c814c0] Starting new cluster due to timestamp
+            # more info about the bug and fix: https://reddit.com/r/ffmpeg/comments/efddfs/
+            write_command = ffmpeg.output(media_input, original_video, output_filename,
+                                          acodec='copy', vcodec='copy', scodec='copy',
+                                          max_interleave_delta='0', loglevel='fatal',
+                                          **{"c:a:0": "aac", "disposition:a:0": "default"}).overwrite_output()
+        ffmpeg_caller = write_command.run_async(pipe_stdin=True, cmd=get_ffmpeg())
+        ffmpeg_caller.stdin.write(media_arr.astype(np.int16).T.tobytes())
+        ffmpeg_caller.stdin.close()
+        ffmpeg_caller.wait()
+    else:
+        # Audio description is in a separate file
+        audio_input = ffmpeg.input(audio_desc_file)
+        video_input = ffmpeg.input(video_file, an=None, ss=start_key_frame)
+
+        # Determine output format
+        output_format = os.path.splitext(output_filename)[1]
+        input_video_format = os.path.splitext(video_file)[1]
+
+        # If output format is the same as input video format, copy video and add audio as a new track
+        if output_format == input_video_format:
+            # Probe the input video for stream information
+            probe = ffmpeg.probe(video_file, cmd=get_ffprobe())
+            video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
+            audio_streams = [stream for stream in probe['streams'] if stream['codec_type'] == 'audio']
+
+            if video_stream is None:
+                raise RuntimeError(f"No video stream found in {video_file}")
+
+            # Map video stream
+            stream_mapping = ['0:' + str(video_stream['index'])]
+
+            # Map existing audio streams and preserve their metadata
+            for audio_stream in audio_streams:
+                stream_index = audio_stream['index']
+                stream_mapping.append('0:' + str(stream_index))
+
+            # Map audio description as a new stream
+            stream_mapping.append('1:a')
+
+            # Construct the ffmpeg command to copy existing streams and add a new audio stream
+            write_command = ffmpeg.output(video_input, audio_input, output_filename, *stream_mapping,
+                                          '-c:v', 'copy', *(f'-c:a:{i}' for i in range(len(audio_streams))), 'copy',
+                                          '-c:a:' + str(len(audio_streams)), 'aac',
+                                          '-metadata:s:a:' + str(len(audio_streams)), f'title={audio_track_name}',
+                                          '-disposition:a:' + str(len(audio_streams)), '0',
+                                          max_interleave_delta='0', loglevel='fatal',
+                                          **{'bsf:v': f'setts=ts=\'{setts_cmd}\'',
+                                             'bsf:s': f'setts=ts=\'{setts_cmd}\''}).overwrite_output()
+            write_command.run(cmd=get_ffmpeg())
+
+        else:
+            # If output format is different, use a pipe to avoid issues with setts
+            # Handle different container formats
+            format = 'matroska' if output_format == '.mkv' else 'nut'
+            write_command = ffmpeg.output(video_input, 'pipe:', format=format, vsync='passthrough',
+                                          c='copy', loglevel='fatal')
+            ffmpeg_caller = write_command.run_async(pipe_stdout=True, cmd=get_ffmpeg())
+            pipe_input = ffmpeg.input('pipe:', format=format, thread_queue_size='512')
+            write_command2 = ffmpeg.output(audio_input, pipe_input, output_filename, c='copy',
+                                           max_interleave_delta='0', loglevel='fatal', vsync='passthrough',
+                                           **{'metadata:s:a:0': f'title={audio_track_name}',
+                                              'bsf:v': f'setts=ts=\'{setts_cmd}\'',
+                                              'bsf:s': f'setts=ts=\'{setts_cmd}\''}).overwrite_output()
+            ffmpeg_caller2 = write_command2.run_async(pipe_stdin=True, cmd=get_ffmpeg())
+
+            while True:
+                in_bytes = ffmpeg_caller.stdout.read(100000)
+                if not in_bytes:
+                    break
+                ffmpeg_caller2.stdin.write(in_bytes)
+            ffmpeg_caller2.stdin.close()
+            ffmpeg_caller.wait()
+            ffmpeg_caller2.wait()
 
 # check whether static_ffmpeg has already installed ffmpeg and ffprobe
 def is_ffmpeg_installed():
